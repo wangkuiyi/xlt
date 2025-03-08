@@ -4,25 +4,13 @@ from jax.sharding import Mesh, PartitionSpec
 from transformers import FlaxLlamaForCausalLM, AutoTokenizer
 import jax.numpy as jnp
 import re
-
-
-MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-model = FlaxLlamaForCausalLM.from_pretrained(MODEL, dtype=jnp.bfloat16)
-tokenizer = AutoTokenizer.from_pretrained(MODEL)
+import pytest
 
 
 def create_device_mesh(
-    mesh_shape: tuple[int, ...],
-    *,
-    mesh_axes: tuple[str, ...] = ("data", "model"),
-    devices: list[jax.Device] = jax.devices(),
+    shape: tuple[int, ...], *, axes: tuple[str, ...], devices: list[jax.Device] = jax.devices()
 ) -> Mesh:
-    return Mesh(jax_create_device_mesh(mesh_shape, devices=devices), mesh_axes)
-
-
-print(len(jax.devices()))
-mesh = create_device_mesh((2, 4))
-print(mesh)
+    return Mesh(jax_create_device_mesh(shape, devices=devices), axes)
 
 
 def shard_params(params):
@@ -52,24 +40,41 @@ def shard_params(params):
     )
 
 
-with mesh:
-    model.params = shard_params(model.params)
+def no_gpu_tpu_available():
+    return not any(d.platform in ("gpu", "tpu") for d in jax.devices())
 
-inputs = tokenizer(
-    [
-        "### Human: What is the color of sea?{prompt}### Assistant:",
-        "### Human: What is the color of sky?{prompt}### Assistant:",
-    ],
-    return_tensors="np",
-)
-with mesh:
-    input_ids = jax.lax.with_sharding_constraint(inputs.input_ids, PartitionSpec("data", None))
-    attention_mask = jax.lax.with_sharding_constraint(
-        inputs.attention_mask, PartitionSpec("data", None)
+
+@pytest.mark.skipif(no_gpu_tpu_available(), reason="Test requires GPU or TPU")
+def test_shard_params():
+    MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    model = FlaxLlamaForCausalLM.from_pretrained(MODEL, dtype=jnp.bfloat16)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+
+    inputs = tokenizer(
+        [
+            "### Human: What is the color of sea?{prompt}### Assistant:",
+            "### Human: What is the color of sky?{prompt}### Assistant:",
+        ],
+        return_tensors="np",
     )
 
-outputs = model.generate(
-    input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=10, params=model.params
-)
-generated_text = tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
-print(generated_text)
+    if (n := jax.device_count()) >= 2:
+        mesh = create_device_mesh((2, n // 2), axes=("data", "model"))  # 2-way DP
+    else:
+        mesh = create_device_mesh((1, 1), axes=("data", "model"))  # 1-way DP
+
+    with mesh:
+        model.params = shard_params(model.params)
+        input_ids = jax.lax.with_sharding_constraint(inputs.input_ids, PartitionSpec("data", None))
+        attention_mask = jax.lax.with_sharding_constraint(
+            inputs.attention_mask, PartitionSpec("data", None)
+        )
+
+    outputs = model.generate(
+        input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=8, params=model.params
+    )
+    generated_text = tokenizer.batch_decode(outputs.sequences, skip_special_tokens=True)
+    assert generated_text == [
+        "### Human: What is the color of sea?{prompt}### Assistant: The color of sea is blue. ###",
+        "### Human: What is the color of sky?{prompt}### Assistant: The color of sky is blue. ###",
+    ], "generated_text"
